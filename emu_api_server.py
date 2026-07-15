@@ -6,7 +6,7 @@ Returns a serialized AuthenticationRequest protobuf that vService
 forwards to Riot's gateway.
 """
 from flask import Flask, request, jsonify
-import os, json, base64, hashlib, struct, time, uuid
+import os, json, base64, hashlib, struct, time, uuid, urllib.request, ssl
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 app = Flask(__name__)
@@ -50,55 +50,100 @@ def _tag(field, wire_type):
     return _varint((field << 3) | wire_type)
 
 def _field_bytes(field, data):
-    """Length-delimited field (wire type 2)"""
     if isinstance(data, str):
         data = data.encode()
     return _tag(field, 2) + _varint(len(data)) + data
 
+def _varint_field(field, value):
+    return _tag(field, 0) + _varint(value)
+
 # ============================================================
-# PROTOBUF — AuthenticationRequest (reverse-engineered from vgc)
-# Fields based on UC analysis:
-#   1 = machine_id  (string)
-#   3 = game_token  (string)        — JWT from Valorant
-#   4 = machine_token (bytes)       — vgk.sys attestation (~1KB)
-#   8 = game_id     (string)
-#  11 = app_info    (string)
-#  12 = device_info (string)
-#  13 = session_id  (string)
+# PROTOBUF — Envelope wrapping AuthenticationRequest
+#
+# Envelope {
+#   MessageType type = 1;  // AUTH_REQUEST = 3
+#   bytes payload = 2;     // serialized AuthenticationRequest
+# }
+#
+# AuthenticationRequest fields (from UC vgc analysis):
+#   1 = machine_id    (string)
+#   3 = game_token    (string) — JWT from Valorant
+#   4 = machine_token (bytes)  — vgk.sys attestation
+#   8 = game_id       (string)
+#  11 = app_info      (string)
+#  12 = device_info   (string)
+#  13 = session_id    (string)
 # ============================================================
-def construct_gateway_payload(gametoken, sid="", puuid=""):
-    payload = bytearray()
+def build_auth_request(gametoken, sid="", puuid=""):
+    req = bytearray()
 
-    # Field 1 — machine_id: use puuid as machine_id if available
-    machine_id = puuid if puuid else sid
-    if machine_id:
-        payload.extend(_field_bytes(1, machine_id))
-
-    # Field 3 — game_token: the JWT from Valorant
-    payload.extend(_field_bytes(3, gametoken))
-
-    # Field 4 — machine_token: vgk.sys attestation placeholder
-    # Real vgc sends ~1KB of attestation data here.
-    # Without it, Riot may return 400. We'll try empty and see.
-    # For now, send a small placeholder
-    dummy_attestation = b"\x00" * 8
-    payload.extend(_field_bytes(4, dummy_attestation))
-
-    # Field 8 — game_id
-    payload.extend(_field_bytes(8, "valorant"))
-
-    # Field 11 — app_info
-    payload.extend(_field_bytes(11, "1.18.2.24"))
-
-    # Field 12 — device_info
-    device_info = "Windows 10.0.19045"
-    payload.extend(_field_bytes(12, device_info))
-
-    # Field 13 — session_id
+    mid = puuid if puuid else sid
+    if mid:
+        req.extend(_field_bytes(1, mid))
+    req.extend(_field_bytes(3, gametoken))
+    # field 4: machine_token placeholder (real vgk attestation ~1KB, we send 16 bytes)
+    req.extend(_field_bytes(4, os.urandom(16)))
+    req.extend(_field_bytes(8, "valorant"))
+    req.extend(_field_bytes(11, "1.18.2.24"))
+    req.extend(_field_bytes(12, "Windows 10.0.19045"))
     if sid:
-        payload.extend(_field_bytes(13, sid))
+        req.extend(_field_bytes(13, sid))
 
-    return bytes(payload)
+    return bytes(req)
+
+# ============================================================
+# Try multiple protobuf formats against Riot's gateway
+# ============================================================
+def try_riot_gateway(host, gametoken, sid, puuid):
+    """Try different protobuf formats until one works (returns 200)."""
+
+    auth_req = build_auth_request(gametoken, sid, puuid)
+
+    formats = [
+        # Format 1: Raw AuthenticationRequest (no wrapper)
+        ("raw_auth_request", auth_req),
+        # Format 2: Envelope(type=3, payload=AuthRequest)
+        ("envelope_wrapped", _varint_field(1, 3) + _field_bytes(2, auth_req)),
+        # Format 3: Just the JWT in field 1 (minimal)
+        ("minimal_jwt", _field_bytes(1, gametoken)),
+    ]
+
+    url = f"https://{host}:8443/vanguard/v1/gateway"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for fmt_name, payload in formats:
+        headers = {
+            "Content-Type": "application/x-protobuf",
+            "User-Agent": "vanguard/1.18.2-24",
+            "X-VG-1": "3",
+            "X-VG-3": "1",
+        }
+        if puuid:
+            headers["X-VG-2"] = puuid
+
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+            riot_data = resp.read()
+            print(f"[GATEWAY] {fmt_name}: HTTP 200 — {len(riot_data)} bytes")
+            return True, payload, riot_data
+        except urllib.error.HTTPError as e:
+            err = e.read()
+            status = e.code
+            code_hex = err[:64].hex() if err else "empty"
+            print(f"[GATEWAY] {fmt_name}: HTTP {status} — {code_hex}")
+            # If 401, format is correct but token is invalid — still valid format
+            if status == 401:
+                print(f"[GATEWAY] {fmt_name}: got 401 (format accepted!)")
+                return True, payload, err
+            continue
+        except Exception as e:
+            print(f"[GATEWAY] {fmt_name}: exception {e}")
+            continue
+
+    return False, None, None
 
 # ============================================================
 # ENDPOINTS
@@ -111,25 +156,35 @@ def gateway_auth():
         sid = inner.get("sid", "")
         puuid = inner.get("puuid", "")
 
-        # Construct AuthenticationRequest protobuf
-        payload = construct_gateway_payload(gametoken, sid, puuid)
+        region = request.headers.get("X-Region", "eu")
+        host = f"{region}.vg.ac.pvp.net"
 
-        # Return the protobuf as base64 "data" — vService will send it to Riot
+        # Try different protobuf formats against Riot's gateway
+        ok, payload, riot_response = try_riot_gateway(host, gametoken, sid, puuid)
+
         session_id = str(uuid.uuid4())
         sessions[session_id] = {
-            "sid": sid,
-            "puuid": puuid,
-            "token": gametoken[:32],
-            "created": time.time()
+            "sid": sid, "puuid": puuid,
+            "token": gametoken[:32], "created": time.time()
         }
 
-        return jsonify({
-            "d": encrypt_envelope({
-                "success": True,
-                "data": base64.b64encode(payload).decode(),
-                "session_id": session_id
+        if ok:
+            # Return the SAME payload as "data" so vService forwards it to Riot
+            # If riot_response came from Riot, vService sends it and gets echo 200
+            return jsonify({
+                "d": encrypt_envelope({
+                    "success": True,
+                    "data": base64.b64encode(payload).decode(),
+                    "session_id": session_id
+                })
             })
-        })
+        else:
+            return jsonify({
+                "d": encrypt_envelope({
+                    "success": False,
+                    "error": "all protobuf formats failed against Riot gateway"
+                })
+            })
     except Exception as e:
         return jsonify({
             "d": encrypt_envelope({
