@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-EMU API v1.0 — Vanguard Gateway Proxy
+EMU API v2.0 — Vanguard Gateway Protobuf Builder
 Protocol: AES-256-GCM encrypted envelopes
+Returns a serialized AuthenticationRequest protobuf that vService
+forwards to Riot's gateway.
 """
 from flask import Flask, request, jsonify
 import os, json, base64, hashlib, struct, time, uuid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import urllib.request
-import ssl
 
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG — bunu kendine gore degistir
+# CONFIG
 # ============================================================
 API_KEY = "12312a29db3b875bf98669d489c23e08d783f546e0352f222c3a638839fa6377"
-REGION = "eu"  # eu / na / kr / ap / br / latam
-# Riot gateway'e gonderirken kullanılacak X-VG header'lari
-X_VG_1 = 3
-X_VG_3 = 1
 
 sessions = {}
 
@@ -40,10 +36,9 @@ def encrypt_envelope(data):
     return base64.b64encode(nonce + ct).decode()
 
 # ============================================================
-# PROTOBUF — Vanguard gateway protokolü
+# PROTOBUF helpers
 # ============================================================
 def _varint(n):
-    """Protobuf varint encoding"""
     buf = bytearray()
     while n > 0x7F:
         buf.append((n & 0x7F) | 0x80)
@@ -51,44 +46,58 @@ def _varint(n):
     buf.append(n & 0x7F)
     return bytes(buf)
 
-def _field_num(field, wire_type):
-    return (field << 3) | wire_type
-
 def _tag(field, wire_type):
-    return _varint(_field_num(field, wire_type))
+    return _varint((field << 3) | wire_type)
 
-def _length_delimited(field, data):
-    return _tag(field, 2) + _varint(len(data)) + (data if isinstance(data, bytes) else data.encode())
+def _field_bytes(field, data):
+    """Length-delimited field (wire type 2)"""
+    if isinstance(data, str):
+        data = data.encode()
+    return _tag(field, 2) + _varint(len(data)) + data
 
-def _varint_field(field, value):
-    return _tag(field, 0) + _varint(value)
-
-def construct_gateway_payload(gametoken, puuid, sid=""):
-    """
-    Vanguard Gateway AuthRequest protobuf'u.
-    Bilinen field'lar:
-      1 = gametoken (string)
-      2 = puuid (string)
-      3 = sid (string)
-      4 = attestation data (bytes) — vgk.sys'ten gelen ~1KB
-      5 = timestamp (uint64)
-      6 = platform (string) = "win32"
-      7 = version (string) = "1.18.2-24"
-    """
+# ============================================================
+# PROTOBUF — AuthenticationRequest (reverse-engineered from vgc)
+# Fields based on UC analysis:
+#   1 = machine_id  (string)
+#   3 = game_token  (string)        — JWT from Valorant
+#   4 = machine_token (bytes)       — vgk.sys attestation (~1KB)
+#   8 = game_id     (string)
+#  11 = app_info    (string)
+#  12 = device_info (string)
+#  13 = session_id  (string)
+# ============================================================
+def construct_gateway_payload(gametoken, sid="", puuid=""):
     payload = bytearray()
-    payload.extend(_length_delimited(1, gametoken))
-    if puuid:
-        payload.extend(_length_delimited(2, puuid))
+
+    # Field 1 — machine_id: use puuid as machine_id if available
+    machine_id = puuid if puuid else sid
+    if machine_id:
+        payload.extend(_field_bytes(1, machine_id))
+
+    # Field 3 — game_token: the JWT from Valorant
+    payload.extend(_field_bytes(3, gametoken))
+
+    # Field 4 — machine_token: vgk.sys attestation placeholder
+    # Real vgc sends ~1KB of attestation data here.
+    # Without it, Riot may return 400. We'll try empty and see.
+    # For now, send a small placeholder
+    dummy_attestation = b"\x00" * 8
+    payload.extend(_field_bytes(4, dummy_attestation))
+
+    # Field 8 — game_id
+    payload.extend(_field_bytes(8, "valorant"))
+
+    # Field 11 — app_info
+    payload.extend(_field_bytes(11, "1.18.2.24"))
+
+    # Field 12 — device_info
+    device_info = "Windows 10.0.19045"
+    payload.extend(_field_bytes(12, device_info))
+
+    # Field 13 — session_id
     if sid:
-        payload.extend(_length_delimited(3, sid))
-    # Attestation (field 4) — bos birak, riot gateway kabul eder mi bilinmez
-    # Timestamp (field 5)
-    ts = int(time.time() * 1000)
-    payload.extend(_varint_field(5, ts))
-    # Platform (field 6)
-    payload.extend(_length_delimited(6, "win32"))
-    # Version (field 7)
-    payload.extend(_length_delimited(7, "1.18.2-24"))
+        payload.extend(_field_bytes(13, sid))
+
     return bytes(payload)
 
 # ============================================================
@@ -102,32 +111,10 @@ def gateway_auth():
         sid = inner.get("sid", "")
         puuid = inner.get("puuid", "")
 
-        # Header'lardan region al veya varsayilani kullan
-        region = request.headers.get("X-Region", REGION)
-        host = f"{region}.vg.ac.pvp.net"
+        # Construct AuthenticationRequest protobuf
+        payload = construct_gateway_payload(gametoken, sid, puuid)
 
-        # Protobuf yapisi
-        payload = construct_gateway_payload(gametoken, puuid, sid)
-
-        # X-VG header'lari
-        headers = {
-            "Content-Type": "application/x-protobuf",
-            "User-Agent": "vanguard/1.18.2-24",
-        }
-        if puuid:
-            headers["X-VG-2"] = puuid
-        headers["X-VG-1"] = str(X_VG_1)
-        headers["X-VG-3"] = str(X_VG_3)
-
-        url = f"https://{host}:8443/vanguard/v1/gateway"
-        req = urllib.request.Request(url, data=payload, headers=headers)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
-        riot_data = resp.read()
-
+        # Return the protobuf as base64 "data" — vService will send it to Riot
         session_id = str(uuid.uuid4())
         sessions[session_id] = {
             "sid": sid,
@@ -139,17 +126,8 @@ def gateway_auth():
         return jsonify({
             "d": encrypt_envelope({
                 "success": True,
-                "data": base64.b64encode(riot_data).decode(),
+                "data": base64.b64encode(payload).decode(),
                 "session_id": session_id
-            })
-        })
-    except urllib.error.HTTPError as e:
-        err_body = e.read()
-        return jsonify({
-            "d": encrypt_envelope({
-                "success": False,
-                "error": f"Riot gateway returned {e.code}",
-                "raw": base64.b64encode(err_body).decode()
             })
         })
     except Exception as e:
@@ -189,14 +167,13 @@ def tasks():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "EMU API running", "version": "1.0"})
+    return jsonify({"status": "EMU API running", "version": "2.0"})
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 443))
-    print(f"[EMU API] Baslatildi — Key: {API_KEY[:16]}...")
-    print(f"[EMU API] Sunucu: http://0.0.0.0:{port}")
-    print(f"[EMU API] Render SSL proxy HTTPS cevirir, burada HTTP yeter")
+    print(f"[EMU API v2] Baslatildi — Key: {API_KEY[:16]}...")
+    print(f"[EMU API v2] Sunucu: http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
